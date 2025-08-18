@@ -1,0 +1,23 @@
+# 민감정보/환경
+.env
+.env.*
+serviceAccountKey.json
+**/serviceAccountKey*.json
+
+# 런타임 생성물
+uploads/
+logs/
+
+# 패키지 폴더
+node_modules/
+
+# 로그/잡파일
+npm-debug.log*
+yarn-error.log*
+
+# (선택) 에디터/OS 잡파일
+.vscode/
+.idea/
+.DS_Store
+
+NUL
