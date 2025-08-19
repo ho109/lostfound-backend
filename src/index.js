@@ -11,7 +11,6 @@ const app = express();
 
 app.use(cors({ origin: true }));               // 개발단계: 모든 도메인 허용
 app.use(express.json({ limit: '10mb' }));      // JSON 바디 파서
-app.use('/uploads', express.static(path.join(process.cwd(), 'uploads'))); // 업로드 파일 서빙
 
 app.get('/', (_req, res) => res.json({ ok: true, service: 'lostfound-api' }));
 

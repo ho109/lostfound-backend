@@ -1,57 +1,62 @@
+// src/routes/items.js
+'use strict';
+
 const express = require('express');
 const { db } = require('../config/firebase');
 const { authRequired } = require('../middleware/auth');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 
 const router = express.Router();
 
-// ---- 설정 ------------------------------------------------------------
 const FLOORS = [1, 2, 3, 4];
-const colName = 'lostItems';                 // ✅ 기존 파이어베이스 컬렉션명
+const COL = 'lostItems';
 const docId = (f) => `floor${f}`;
 
-// 업로드 폴더 보장
-const UPLOAD_DIR = path.join(process.cwd(), 'uploads');
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, Date.now() + '-' + Math.random().toString(36).slice(2) + ext);
-  },
+// 디스크 대신 메모리 버퍼 사용
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 3 * 1024 * 1024 }, // 3MB 제한 (문서 크기 보호)
 });
-const upload = multer({ storage });
 
-// ---- 유틸 ------------------------------------------------------------
-function genId() {
-  return String(Date.now()) + Math.random().toString(36).slice(2, 7);
-}
-function normalizeItem(it, floor) {
-  // 기존 문서엔 image(base64)일 수도, imageUrl일 수도 있음
-  const imageUrl = it.imageUrl || it.image || null;
-  return { ...it, floor, imageUrl };
-}
-async function getFloorItems(floor) {
-  const snap = await db.collection(colName).doc(docId(floor)).get();
-  const arr = snap.exists ? (snap.data().items || []) : [];
-  return arr.map((it) => normalizeItem(it, floor));
-}
-async function findItemById(id) {
+// 유틸
+const genId = () => String(Date.now()) + Math.random().toString(36).slice(2, 7);
+
+const toDataURL = (file) => {
+  if (!file || !file.buffer) return null;
+  const mime = file.mimetype || 'image/jpeg';
+  const b64 = file.buffer.toString('base64');
+  return `data:${mime};base64,${b64}`;
+};
+
+const readFloorItems = async (floor) => {
+  const snap = await db.collection(COL).doc(docId(floor)).get();
+  return snap.exists ? (snap.data().items || []) : [];
+};
+const writeFloorItems = (floor, items) =>
+  db.collection(COL).doc(docId(floor)).set({ items });
+
+const normalizeItem = (it, floor, req) => {
+  // image(data URL) 우선, 그 다음 imageUrl(옛 데이터)
+  let image = it.image || null;
+  let imageUrl = it.imageUrl || null;
+
+  // 예전 '/uploads/..' 상대경로가 남아있다면 절대경로로 보정
+  if (!image && imageUrl && imageUrl.startsWith('/')) {
+    imageUrl = `${req.protocol}://${req.get('host')}${imageUrl}`;
+  }
+  return { ...it, floor, image, imageUrl };
+};
+
+const findItemById = async (id) => {
   for (const f of FLOORS) {
-    const snap = await db.collection(colName).doc(docId(f)).get();
-    if (!snap.exists) continue;
-    const arr = snap.data().items || [];
-    const idx = arr.findIndex((x) => x.id === id);
-    if (idx >= 0) return { floor: f, index: idx, item: arr[idx], items: arr };
+    const items = await readFloorItems(f);
+    const index = items.findIndex((x) => x.id === id);
+    if (index >= 0) return { floor: f, index, items, item: items[index] };
   }
   return null;
-}
+};
 
-// ---- 목록 ------------------------------------------------------------
-/** GET /api/items?floor=1&q=키워드  */
+// 목록
 router.get('/', async (req, res) => {
   try {
     const { floor, q } = req.query;
@@ -60,19 +65,20 @@ router.get('/', async (req, res) => {
     if (floor) {
       const f = Number(floor);
       if (!FLOORS.includes(f)) return res.status(400).json({ error: 'bad floor' });
-      list = await getFloorItems(f);
+      list = (await readFloorItems(f)).map((it) => normalizeItem(it, f, req));
     } else {
-      // 전체
-      const all = await Promise.all(FLOORS.map((f) => getFloorItems(f)));
+      const all = await Promise.all(
+        FLOORS.map(async (f) => (await readFloorItems(f)).map((it) => normalizeItem(it, f, req)))
+      );
       list = all.flat();
     }
 
     if (q && String(q).trim() !== '') {
-      const query = String(q).toLowerCase();
+      const qq = String(q).toLowerCase();
       list = list.filter(
         (i) =>
-          (i.title || '').toLowerCase().includes(query) ||
-          (i.desc || '').toLowerCase().includes(query)
+          (i.title || '').toLowerCase().includes(qq) ||
+          (i.desc || '').toLowerCase().includes(qq)
       );
     }
 
@@ -84,26 +90,24 @@ router.get('/', async (req, res) => {
   }
 });
 
-// ---- 상세 ------------------------------------------------------------
-/** GET /api/items/:id */
+// 상세
 router.get('/:id', async (req, res) => {
   try {
     const found = await findItemById(req.params.id);
     if (!found) return res.status(404).json({ error: 'Not found' });
     const { floor, item } = found;
-    return res.json(normalizeItem(item, floor));
+    res.json(normalizeItem(item, floor, req));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Get failed' });
   }
 });
 
-// ---- 등록 ------------------------------------------------------------
-/** POST /api/items  (관리자) - multipart(form-data) 또는 JSON */
+// 등록 (관리자)
 router.post('/', authRequired, upload.single('image'), async (req, res) => {
   try {
     const title = (req.body.title || '').trim();
-    const desc = (req.body.desc || '').trim();
+    const desc  = (req.body.desc  || '').trim();
     const floor = Number(req.body.floor);
     if (!title || !FLOORS.includes(floor)) {
       return res.status(400).json({ error: 'title/floor invalid' });
@@ -113,25 +117,28 @@ router.post('/', authRequired, upload.single('image'), async (req, res) => {
       id: genId(),
       title,
       desc,
-      floor,               // 보조적으로 저장(문서에도 있지만 유지)
+      floor,
       createdAt: Date.now(),
     };
 
-    // 이미지 처리: 파일 → imageUrl, 없으면 그대로(null)
-    if (req.file) {
-      newItem.imageUrl = `/uploads/${req.file.filename}`;
+    // 파일 → dataURL, 아니면 body.image(dataURL), 아니면 imageUrl(절대URL) 허용
+    if (req.file && req.file.buffer) {
+      newItem.image = toDataURL(req.file);
+      delete newItem.imageUrl;
     } else if (req.body.image) {
-      // 혹시 프런트에서 base64(dataURL)로 줄 경우 호환
-      newItem.image = req.body.image;
+      newItem.image = String(req.body.image);
+      delete newItem.imageUrl;
+    } else if (req.body.imageUrl) {
+      newItem.imageUrl = String(req.body.imageUrl);
+      delete newItem.image;
     } else {
-      newItem.imageUrl = null;
+      newItem.image = null;
+      delete newItem.imageUrl;
     }
 
-    const ref = db.collection(colName).doc(docId(floor));
-    const snap = await ref.get();
-    const items = snap.exists ? (snap.data().items || []) : [];
+    const items = await readFloorItems(floor);
     items.push(newItem);
-    await ref.set({ items });
+    await writeFloorItems(floor, items);
 
     res.status(201).json({ id: newItem.id });
   } catch (e) {
@@ -140,10 +147,7 @@ router.post('/', authRequired, upload.single('image'), async (req, res) => {
   }
 });
 
-// ---- 수정 ------------------------------------------------------------
-/** PUT /api/items/:id  (관리자) - multipart(form-data 또는 JSON)
- *  floor가 바뀌면 해당 층 문서로 "이동"
- */
+// 수정 (관리자)
 router.put('/:id', authRequired, upload.single('image'), async (req, res) => {
   try {
     const found = await findItemById(req.params.id);
@@ -153,28 +157,31 @@ router.put('/:id', authRequired, upload.single('image'), async (req, res) => {
     const updating = { ...items[index] };
 
     if (req.body.title !== undefined) updating.title = req.body.title;
-    if (req.body.desc !== undefined) updating.desc = req.body.desc;
-    // 이미지 교체
-    if (req.file) {
-      updating.imageUrl = `/uploads/${req.file.filename}`;
-      delete updating.image; // 기존 base64 필드는 제거
+    if (req.body.desc  !== undefined) updating.desc  = req.body.desc;
+
+    // 이미지 교체: dataURL 우선
+    if (req.file && req.file.buffer) {
+      updating.image = toDataURL(req.file);
+      delete updating.imageUrl;
+    } else if (req.body.image) {
+      updating.image = String(req.body.image);
+      delete updating.imageUrl;
+    } else if (req.body.imageUrl) {
+      updating.imageUrl = String(req.body.imageUrl);
+      delete updating.image;
     }
-    // 층 이동 여부
-    const newFloor =
-      req.body.floor !== undefined ? Number(req.body.floor) : curFloor;
+
+    const newFloor = req.body.floor !== undefined ? Number(req.body.floor) : curFloor;
     if (!FLOORS.includes(newFloor)) return res.status(400).json({ error: 'bad floor' });
 
-    // 현재 층에서 제거
+    // 현재 층에서 제거 → 새 층에 추가
     items.splice(index, 1);
-    await db.collection(colName).doc(docId(curFloor)).set({ items });
+    await writeFloorItems(curFloor, items);
 
-    // 목적 층에 추가(또는 수정)
-    const dstRef = db.collection(colName).doc(docId(newFloor));
-    const dstSnap = await dstRef.get();
-    const dstItems = dstSnap.exists ? (dstSnap.data().items || []) : [];
+    const dstItems = await readFloorItems(newFloor);
     updating.floor = newFloor;
     dstItems.push(updating);
-    await dstRef.set({ items: dstItems });
+    await writeFloorItems(newFloor, dstItems);
 
     res.json({ ok: true });
   } catch (e) {
@@ -183,8 +190,7 @@ router.put('/:id', authRequired, upload.single('image'), async (req, res) => {
   }
 });
 
-// ---- 삭제 ------------------------------------------------------------
-/** DELETE /api/items/:id  (관리자) */
+// 삭제 (관리자)
 router.delete('/:id', authRequired, async (req, res) => {
   try {
     const found = await findItemById(req.params.id);
@@ -192,7 +198,8 @@ router.delete('/:id', authRequired, async (req, res) => {
 
     const { floor, index, items } = found;
     items.splice(index, 1);
-    await db.collection(colName).doc(docId(floor)).set({ items });
+    await writeFloorItems(floor, items);
+
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
